@@ -16,6 +16,12 @@ from datetime import datetime, timedelta
 import random
 import string
 
+# Supabase client (optional - uncomment when ready)
+# from supabase import create_client, Client
+# SUPABASE_URL = os.getenv("SUPABASE_URL")
+# SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 # Initialize FastAPI
 app = FastAPI(title="Kabbalah Code API", version="1.0.0")
 
@@ -28,16 +34,260 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage (replace with Supabase/PostgreSQL for production)
+# In-memory storage (replace with Supabase in production)
 users_db = {}
 predictions_db = {}
-referrals_db = {}
-tasks_db = []
-ugc_submissions = []
 
 # Environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "KABBALAH_ADMIN_2025")
+
+# Models
+class UserOnboard(BaseModel):
+    telegram_id: int
+    username: str
+    evm_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    twitter_username: str
+
+class User(BaseModel):
+    telegram_id: int
+    username: str
+    evm_address: str
+    twitter_username: str
+    level: int = 1
+    xp: int = 0
+    points: int = 0
+    referrer_id: Optional[int] = None
+    last_spin: Optional[datetime] = None
+    last_prediction: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+
+class PredictionResponse(BaseModel):
+    text: str
+    image_url: str
+    code: str
+    mystical_hash: str
+
+class VerifyCode(BaseModel):
+    code: str
+    tweet_url: str
+
+class SpinResult(BaseModel):
+    points: int
+
+# Utility Functions
+def generate_mystical_code() -> str:
+    """Generate unique verification code"""
+    return 'KC' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+def generate_prediction() -> dict:
+    """Generate daily prediction"""
+    predictions = [
+        "Today the gates of ancient wisdom open. Sephira Chokmah illuminates your path through digital realms.",
+        "Energies of Binah protect your journey. Time for deep meditation on blockchain mysteries.",
+        "Malkuth grants material abundance in the metaverse. Act boldly with your transactions!",
+        "Tiferet harmonizes your endeavors. A day for important decisions in the Web3 space.",
+        "Netzach empowers your creative vision. Share your wisdom with the community.",
+        "Hod brings clarity to complex protocols. Study the ancient codes carefully today.",
+        "Yesod connects you to the foundation. Your network grows stronger.",
+        "Gevurah demands discipline. Review your security and strengthen your defenses."
+    ]
+    
+    return {
+        "text": random.choice(predictions),
+        "image_url": f"https://api.dicebear.com/7.x/shapes/svg?seed={random.randint(1000, 9999)}",
+        "code": generate_mystical_code(),
+        "mystical_hash": hashlib.sha256(str(datetime.now()).encode()).hexdigest()[:16]
+    }
+
+def calculate_xp_for_level(level: int) -> int:
+    """Calculate XP needed for next level"""
+    return 1000 * level + 500 * (level - 1)
+
+def add_points_and_xp(user: User, points: int):
+    """Add points and XP, handle level up"""
+    user.points += points
+    user.xp += points
+    
+    xp_needed = calculate_xp_for_level(user.level)
+    if user.xp >= xp_needed:
+        user.level += 1
+        user.xp -= xp_needed
+
+# API Endpoints
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Kabbalah Code API",
+        "version": "1.0.0",
+        "status": "operational"
+    }
+
+@app.post("/api/auth/onboard")
+async def onboard_user(data: UserOnboard, referrer: Optional[int] = None):
+    """Onboard new user"""
+    # Check if user already exists
+    if data.telegram_id in users_db:
+        return users_db[data.telegram_id]
+    
+    user = User(
+        telegram_id=data.telegram_id,
+        username=data.username,
+        evm_address=data.evm_address,
+        twitter_username=data.twitter_username,
+        referrer_id=referrer
+    )
+    
+    users_db[data.telegram_id] = user
+    
+    # TODO: Save to Supabase
+    # supabase.table("users").insert(user.dict()).execute()
+    
+    return user.dict()
+
+@app.get("/api/user/profile")
+async def get_profile(telegram_id: int):
+    """Get user profile"""
+    if telegram_id not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = users_db[telegram_id]
+    referral_count = sum(1 for u in users_db.values() if u.referrer_id == telegram_id)
+    
+    return {
+        **user.dict(),
+        "referrals": referral_count,
+        "xp_to_next": calculate_xp_for_level(user.level)
+    }
+
+@app.get("/api/prediction/daily")
+async def get_daily_prediction(telegram_id: int):
+    """Get daily prediction"""
+    if telegram_id not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = users_db[telegram_id]
+    today = datetime.now().date()
+    
+    if user.last_prediction and user.last_prediction.date() == today:
+        # Return cached prediction
+        cache_key = f"{telegram_id}_{today}"
+        if cache_key in predictions_db:
+            return predictions_db[cache_key]
+    
+    # Generate new prediction
+    prediction = generate_prediction()
+    cache_key = f"{telegram_id}_{today}"
+    predictions_db[cache_key] = prediction
+    user.last_prediction = datetime.now()
+    
+    return prediction
+
+@app.post("/api/prediction/verify")
+async def verify_prediction(telegram_id: int, data: VerifyCode):
+    """Verify tweet and award points"""
+    if telegram_id not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = users_db[telegram_id]
+    today = datetime.now().date()
+    cache_key = f"{telegram_id}_{today}"
+    
+    if cache_key not in predictions_db:
+        raise HTTPException(status_code=400, detail="No prediction for today")
+    
+    prediction = predictions_db[cache_key]
+    
+    if data.code != prediction['code']:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+    
+    # Award points
+    points = 100
+    add_points_and_xp(user, points)
+    
+    return {
+        "success": True,
+        "points_earned": points,
+        "new_balance": user.points
+    }
+
+@app.post("/api/fortune/spin")
+async def spin_fortune(telegram_id: int):
+    """Spin the fortune tape"""
+    if telegram_id not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user = users_db[telegram_id]
+    today = datetime.now().date()
+    
+    if user.last_spin and user.last_spin.date() == today:
+        raise HTTPException(status_code=400, detail="Already spun today")
+    
+    # Random reward
+    prizes = [50, 100, 150, 200, 500, 1000]
+    weights = [30, 25, 20, 15, 8, 2]
+    points = random.choices(prizes, weights=weights)[0]
+    
+    add_points_and_xp(user, points)
+    user.last_spin = datetime.now()
+    
+    return {
+        "points": points,
+        "new_balance": user.points
+    }
+
+@app.get("/api/leaderboard")
+async def get_leaderboard(limit: int = 100):
+    """Get top users"""
+    sorted_users = sorted(
+        users_db.values(),
+        key=lambda u: u.points,
+        reverse=True
+    )[:limit]
+    
+    return [
+        {
+            "telegram_id": u.telegram_id,
+            "username": u.username,
+            "level": u.level,
+            "points": u.points,
+            "rank": i + 1
+        }
+        for i, u in enumerate(sorted_users)
+    ]
+
+@app.get("/api/referral/stats")
+async def get_referral_stats(telegram_id: int):
+    """Get referral statistics"""
+    if telegram_id not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    direct_referrals = [u for u in users_db.values() if u.referrer_id == telegram_id]
+    
+    level2_refs = []
+    for ref in direct_referrals:
+        level2_refs.extend([u for u in users_db.values() if u.referrer_id == ref.telegram_id])
+    
+    level3_refs = []
+    for ref in level2_refs:
+        level3_refs.extend([u for u in users_db.values() if u.referrer_id == ref.telegram_id])
+    
+    return {
+        "level1_count": len(direct_referrals),
+        "level2_count": len(level2_refs),
+        "level3_count": len(level3_refs),
+        "total_earned": sum(u.points for u in direct_referrals) * 0.1
+    }
+
+# Health check for Render
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 # Models
 class UserOnboard(BaseModel):
